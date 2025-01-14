@@ -1,8 +1,11 @@
 import logging
 from collections import OrderedDict
 
+from django.conf import settings
+
 from catalog.book.utils import detect_isbn_asin
 from catalog.common import *
+from catalog.game.models import GameReleaseType
 from catalog.models import *
 from common.models.lang import detect_language
 
@@ -27,32 +30,81 @@ class Bangumi(AbstractSite):
 
     def scrape(self):
         api_url = f"https://api.bgm.tv/v0/subjects/{self.id_value}"
-        o = BasicDownloader(api_url).download().json()
+        o = (
+            BasicDownloader(
+                api_url,
+                headers={
+                    "User-Agent": settings.NEODB_USER_AGENT,
+                },
+            )
+            .download()
+            .json()
+        )
         showtime = None
         pub_year = None
         pub_month = None
         year = None
         dt = o.get("date")
-        episodes = o.get("total_episodes", 0)
+        release_type = None
+        related_resources = []
         match o["type"]:
             case 1:
+                if o["series"]:
+                    model = "Work"
+                    # model = "Series" TODO Series
+                    res = (
+                        BasicDownloader(
+                            f"https://api.bgm.tv/v0/subjects/{self.id_value}/subjects",
+                            headers={
+                                "User-Agent": settings.NEODB_USER_AGENT,
+                            },
+                        )
+                        .download()
+                        .json()
+                    )
+                    for s in res:
+                        if s["relation"] != "单行本":
+                            continue
+                        related_resources.append(
+                            {
+                                "url": Bangumi.id_to_url(s["id"]),
+                            }
+                        )
                 model = "Edition"
                 if dt:
                     d = dt.split("-")
                     pub_year = d[0]
                     pub_month = d[1]
             case 2 | 6:
-                is_series = episodes > 1
-                model = "TVSeason" if is_series else "Movie"
+                is_season = o["platform"] in {
+                    "TV",
+                    "OVA",  # may be movie in other sites
+                    "WEB",
+                    "电视剧",
+                    "欧美剧",
+                    "日剧",
+                    "华语剧",
+                    "综艺",
+                }
+                model = "TVSeason" if is_season else "Movie"
+                if "舞台剧" in [
+                    t["name"] for t in o["tags"]
+                ]:  # 只能这样判断舞台剧了，bangumi三次元分类太少
+                    model = "Performance"
                 if dt:
                     year = dt.split("-")[0]
                     showtime = [
-                        {"time": dt, "region": "首播日期" if is_series else "发布日期"}
+                        {"time": dt, "region": "首播日期" if is_season else "发布日期"}
                     ]
             case 3:
                 model = "Album"
             case 4:
                 model = "Game"
+                match o["platform"]:
+                    case "游戏":
+                        release_type = GameReleaseType.GAME
+                    case "扩展包":
+                        release_type = GameReleaseType.DLC
             case _:
                 raise ValueError(
                     f"Unknown type {o['type']} for bangumi subject {self.id_value}"
@@ -60,7 +112,7 @@ class Bangumi(AbstractSite):
         title = o.get("name_cn") or o.get("name")
         orig_title = o.get("name") if o.get("name") != title else None
         brief = o.get("summary")
-
+        episodes = o.get("total_episodes", 0)
         genre = None
         platform = None
         other_title = []
@@ -69,13 +121,19 @@ class Bangumi(AbstractSite):
         isbn = None
         language = None
         pub_house = None
-        authors = None
+        orig_creator = None
+        authors = []
         site = None
         director = None
+        playwright = None
+        actor = None
         pages = None
         price = None
+        opening_date = None
+        closing_date = None
+        location = None
         for i in o.get("infobox", []):
-            k = i["key"]
+            k = i["key"].lower()
             v = i["value"]
             match k:
                 case "别名":
@@ -84,9 +142,14 @@ class Bangumi(AbstractSite):
                         if isinstance(v, list)
                         else ([v] if isinstance(v, str) else [])
                     )
+                case "话数":
+                    try:
+                        episodes = int(v)
+                    except ValueError:
+                        pass
                 case "imdb_id":
                     imdb_code = v
-                case "isbn" | "ISBN":
+                case "isbn":
                     isbn_type, isbn = detect_isbn_asin(v)
                 case "语言":
                     language = v
@@ -94,8 +157,26 @@ class Bangumi(AbstractSite):
                     pub_house = v
                 case "导演":
                     director = v
+                case "编剧" | "脚本":
+                    playwright = (
+                        [d["v"] for d in v]
+                        if isinstance(v, list)
+                        else ([v] if isinstance(v, str) else [])
+                    )
+                case "原作":
+                    match model:
+                        case "Edition":
+                            authors.append(v)
+                        case "Performance":
+                            orig_creator = (
+                                [d["v"] for d in v]
+                                if isinstance(v, list)
+                                else ([v] if isinstance(v, str) else [])
+                            )
+                case "作画":
+                    authors.append(v)
                 case "作者":
-                    authors = (
+                    authors.extend(
                         [d["v"] for d in v]
                         if isinstance(v, list)
                         else ([v] if isinstance(v, str) else [])
@@ -106,7 +187,7 @@ class Bangumi(AbstractSite):
                         if isinstance(v, list)
                         else ([v] if isinstance(v, str) else [])
                     )
-                case "游戏类型":
+                case "游戏类型" | "类型":
                     genre = (
                         [d["v"] for d in v]
                         if isinstance(v, list)
@@ -118,6 +199,25 @@ class Bangumi(AbstractSite):
                     pages = v
                 case "价格":
                     price = v
+                case "开始":
+                    opening_date = v
+                case "结束":
+                    closing_date = v
+                case "演出":
+                    if model == "Performance":
+                        director = v
+                case "主演":
+                    actor = (
+                        [{"name": d["v"], "role": None} for d in v]
+                        if isinstance(v, list)
+                        else (
+                            [{"name": w, "role": None} for w in v.split("、")]
+                            if isinstance(v, str)
+                            else []
+                        )
+                    )
+                case "会场" | "演出地点":
+                    location = v
 
         img_url = o["images"].get("large") or o["images"].get("common")
         raw_img = None
@@ -145,12 +245,16 @@ class Bangumi(AbstractSite):
             "title": title,
             "orig_title": orig_title,
             "other_title": other_title or None,
+            "orig_creator": orig_creator,
             "author": authors,
             "genre": genre,
             "translator": None,
             "director": director,
+            "playwright": playwright,
+            "actor": actor,
             "language": language,
             "platform": platform,
+            "release_type": release_type,
             "year": year,
             "showtime": showtime,
             "imdb_code": imdb_code,
@@ -167,6 +271,10 @@ class Bangumi(AbstractSite):
             "release_date": dt,
             "pages": pages,
             "price": price,
+            "opening_date": opening_date,
+            "closing_date": closing_date,
+            "location": location,
+            "related_resources": related_resources,
         }
         lookup_ids = {}
         if isbn:
